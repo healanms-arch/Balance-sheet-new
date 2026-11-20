@@ -7,7 +7,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="DocReconcile">
-    <meta name="description" content="Doctor Payment Reconciliation and Cashier Balance Management System - Live Online Cloud Sync.">
+    <meta name="description" content="Doctor Payment Reconciliation and Cashier Balance Management System - Live Online Cloud Sync. Previous Session Voucher Loader Update 2.56.">
     <meta name="keywords" content="doctor payment reconciliation, arogya health system, echannelling cashier report, hospital cash management, medical accounting">
     <title>Doctor Payment Reconciliation System</title>
     <!-- Dynamic PWA Manifest & Offline App Setup -->
@@ -534,22 +534,26 @@
                                 if (Array.isArray(cloudData.cbDocVouchersList)) setCbDocVouchersList(cloudData.cbDocVouchersList);
                                 if (Array.isArray(cloudData.cbOtherPaymentsList)) setCbOtherPaymentsList(cloudData.cbOtherPaymentsList);
                                 if (Array.isArray(cloudData.pettyVouchers)) {
-                                    const localVouchers = JSON.parse(localStorage.getItem('app_petty_vouchers') || '[]');
-                                    const mergedMap = new Map();
-                                    [...cloudData.pettyVouchers, ...(Array.isArray(localVouchers) ? localVouchers : [])].forEach((v, i) => mergedMap.set(v.id || `petty-${i}`, v));
-                                    const mergedVouchers = Array.from(mergedMap.values());
-                                    setPettyVouchers(mergedVouchers);
-                                    localStorage.setItem('app_petty_vouchers', JSON.stringify(mergedVouchers));
+                                    // Cloud arrays are authoritative. Merging local records here
+                                    // resurrected vouchers after the user had deleted a session.
+                                    const cloudVouchers = cloudData.pettyVouchers;
+                                    setPettyVouchers(cloudVouchers);
+                                    localStorage.setItem('app_petty_vouchers', JSON.stringify(cloudVouchers));
                                 }
                                 if (Array.isArray(cloudData.pettySessions)) {
-                                    const localSessions = JSON.parse(localStorage.getItem('app_petty_sessions') || '[]');
-                                    const mergedSessions = new Map();
-                                    [...cloudData.pettySessions, ...(Array.isArray(localSessions) ? localSessions : [])].forEach((item, i) => mergedSessions.set(item.id || `session-${i}`, item));
-                                    const mergedSessionList = Array.from(mergedSessions.values());
-                                    setPettySessions(mergedSessionList);
-                                    localStorage.setItem('app_petty_sessions', JSON.stringify(mergedSessionList));
+                                    // Protect saved reports from an empty/stale cloud snapshot.
+                                    // If this browser already has session reports but the cloud
+                                    // returns an empty array, keep the local reports and restore
+                                    // them to cloud instead of silently hiding the history.
+                                    let localSessions = [];
+                                    try { localSessions = JSON.parse(localStorage.getItem('app_petty_sessions') || '[]'); } catch (_) {}
+                                    const cloudSessions = cloudData.pettySessions;
+                                    const resolvedSessions = mergePettySessionRecords(cloudSessions, localSessions);
+                                    setPettySessions(resolvedSessions);
+                                    localStorage.setItem('app_petty_sessions', JSON.stringify(resolvedSessions));
+                                    if (JSON.stringify(resolvedSessions) !== JSON.stringify(cloudSessions)) syncToCloud({ pettySessions: resolvedSessions });
                                 }
-                                if (cloudData.activePettySessionId && !localStorage.getItem('app_petty_active_session')) {
+                                if (cloudData.activePettySessionId && !localStorage.getItem('app_petty_active_session') && !localStorage.getItem('app_petty_session_start_flow_v227')) {
                                     localStorage.setItem('app_petty_active_session', cloudData.activePettySessionId);
                                     localStorage.setItem('app_petty_active_session_opening', cloudData.activePettySessionOpening || '0');
                                     localStorage.setItem('app_petty_active_session_started', cloudData.activePettySessionStartedAt || '');
@@ -640,6 +644,7 @@
                         activePettySessionId,
                         activePettySessionOpening,
                         activePettySessionStartedAt,
+                        activePettyTopUps,
                         pettyDailyFloats,
                         customTabs,
                         customTabContent,
@@ -816,11 +821,26 @@
                 const saved = localStorage.getItem('app_petty_sessions');
                 return saved ? JSON.parse(saved) : [];
             });
-            const [activePettySessionId, setActivePettySessionId] = useState(() => localStorage.getItem('app_petty_active_session') || '');
+            // Version 2.33: Lock session opening float after start; record additional funds as separate top-up entries included in balance and session reports.
+            // Version 2.31: Petty Cash vouchers and reports are filterable by exact session ID; overnight sessions appear in date-range history by their full start/end span. Reopening never absorbs unassigned same-date vouchers.
+            // Version 2.28: cloud snapshots now replace Petty Cash arrays instead of merging them.
+            // This prevents deleted session reports and vouchers from reappearing from local cache.
+            // Version 2.41 safety fix: never clear an active Petty Cash session during
+            // an application upgrade. Earlier one-time migration flags could erase the
+            // active session pointer/opening amount on a fresh browser profile, making
+            // session controls disappear even though the vouchers and reports remained.
+            // Preserve all local session state; users can explicitly end/reopen sessions.
+            const [activePettySessionId, setActivePettySessionId] = useState(() => {
+                const savedSessionId = localStorage.getItem('app_petty_active_session') || '';
+                return savedSessionId === '__closed__' ? '' : savedSessionId;
+            });
             const [activePettySessionOpening, setActivePettySessionOpening] = useState(() => localStorage.getItem('app_petty_active_session_opening') || '');
             const [activePettySessionStartedAt, setActivePettySessionStartedAt] = useState(() => localStorage.getItem('app_petty_active_session_started') || '');
             const [selectedPettyReport, setSelectedPettyReport] = useState(null);
             const [newPettySessionAmount, setNewPettySessionAmount] = useState('');
+            const [editPettyOpeningAmount, setEditPettyOpeningAmount] = useState('');
+            const [newPettyTopUpAmount, setNewPettyTopUpAmount] = useState('');
+            const [activePettyTopUps, setActivePettyTopUps] = useState(() => { const saved = localStorage.getItem('app_petty_active_topups'); try { return saved ? JSON.parse(saved) : []; } catch (_) { return []; } });
             const [pettyOpenAmount, setPettyOpenAmount] = useState(() => {
                 return localStorage.getItem('app_petty_open_amount') || '';
             });
@@ -830,6 +850,8 @@
                 return started && !Number.isNaN(parsed.getTime()) ? `${parsed.getFullYear()}-${String(parsed.getMonth()+1).padStart(2,'0')}-${String(parsed.getDate()).padStart(2,'0')}` : new Date().toISOString().split('T')[0];
             });
             const [pettyDateTo, setPettyDateTo] = useState(() => new Date().toISOString().split('T')[0]);
+            // Session filter keeps each overnight / same-day cash session's vouchers separate.
+            const [selectedPettySessionFilter, setSelectedPettySessionFilter] = useState(() => localStorage.getItem('app_petty_active_session') && localStorage.getItem('app_petty_active_session') !== '__closed__' ? localStorage.getItem('app_petty_active_session') : 'none');
             const [pettyTimeFrom, setPettyTimeFrom] = useState('00:00');
             const [pettyTimeTo, setPettyTimeTo] = useState('23:59');
             const [pettyDailyFloats, setPettyDailyFloats] = useState(() => {
@@ -847,13 +869,15 @@
                         localStorage.setItem('app_petty_active_session', activePettySessionId);
                         localStorage.setItem('app_petty_active_session_opening', String(activePettySessionOpening || '0'));
                         localStorage.setItem('app_petty_active_session_started', activePettySessionStartedAt || '');
+                        localStorage.setItem('app_petty_active_topups', JSON.stringify(activePettyTopUps));
                     } else {
                         localStorage.removeItem('app_petty_active_session');
                         localStorage.removeItem('app_petty_active_session_opening');
                         localStorage.removeItem('app_petty_active_session_started');
+                        localStorage.removeItem('app_petty_active_topups');
                     }
                 } catch (storageError) { console.warn('Petty Cash local backup warning:', storageError); }
-            }, [pettyVouchers, pettySessions, pettyDailyFloats, activePettySessionId, activePettySessionOpening, activePettySessionStartedAt]);
+            }, [pettyVouchers, pettySessions, pettyDailyFloats, activePettySessionId, activePettySessionOpening, activePettySessionStartedAt, activePettyTopUps]);
 
             // On every fresh app launch, show all vouchers from the active session by default.
             useEffect(() => {
@@ -875,6 +899,12 @@
                 setPettyTimeFrom('00:00');
                 setPettyTimeTo('23:59');
             }, [activePettySessionId, activePettySessionStartedAt]);
+
+            // Default Issued Vouchers List to the active session only. If no session is
+            // active, show an empty list; historical sessions are loaded only on request.
+            useEffect(() => {
+                setSelectedPettySessionFilter(activePettySessionId ? String(activePettySessionId) : 'none');
+            }, [activePettySessionId]);
 
             const currentPettyOpenAmount = useMemo(() => {
                 // The opening cash entered when the active session starts is the source
@@ -931,12 +961,126 @@
             };
 
             const filteredPettyVouchers = useMemo(() => {
-                return pettyVouchers.filter(v => {
-                    const vDate = normalizePettyVoucherDate(v.isoDate) || normalizePettyVoucherDate(v.date);
-                    const vTime = String(v.time || '00:00').slice(0, 5);
-                    return !!vDate && vDate >= pettyDateFrom && vDate <= pettyDateTo && vTime >= pettyTimeFrom && vTime <= pettyTimeTo;
+                // When a previous session is selected, use its archived voucher snapshot as
+                // a recovery source too. This makes old session vouchers load even if the
+                // live Issued Vouchers store no longer contains those rows.
+                const selectedSession = selectedPettySessionFilter !== 'all'
+                    ? pettySessions.find(session => String(session.id) === String(selectedPettySessionFilter))
+                    : null;
+                let voucherSource = Array.isArray(pettyVouchers) ? [...pettyVouchers] : [];
+                if (selectedSession && Array.isArray(selectedSession.vouchers)) {
+                    const presentKeys = new Set(voucherSource.map(v => `${v.sessionId || ''}::${v.id || ''}`));
+                    selectedSession.vouchers.forEach(v => {
+                        const restored = { ...v, sessionId: v.sessionId || selectedSession.id };
+                        const key = `${restored.sessionId}::${restored.id || ''}`;
+                        if (!presentKeys.has(key)) voucherSource.push(restored);
+                    });
+                }
+                // 'none' means there is no active session and no historical session
+                // has been explicitly selected. Keep the live list empty in that state.
+                if (selectedPettySessionFilter === 'none') return [];
+                // Show only the selected session's vouchers, independently of unrelated
+                // dashboard dates; the session's own saved date bounds are applied above.
+                return voucherSource.filter(v => {
+                    const vDate = normalizePettyVoucherDate(v.isoDate) || normalizePettyVoucherDate(v.date) || normalizePettyVoucherDate(v.createdAt);
+                    if (!vDate || vDate < pettyDateFrom || vDate > pettyDateTo) return false;
+                    if (selectedPettySessionFilter !== 'all') {
+                        const voucherSessionKey = v.sessionId ? String(v.sessionId) : 'legacy';
+                        if (voucherSessionKey !== String(selectedPettySessionFilter)) return false;
+                    }
+
+                    // Keep the optional time window, normalizing both 24-hour and AM/PM values.
+                    const rawTime = String(v.time || '00:00').trim();
+                    let vTime = rawTime.slice(0, 5);
+                    const parts = rawTime.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+                    if (parts) {
+                        let hour = Number(parts[1]) % 12;
+                        if (parts[3].toUpperCase() === 'PM') hour += 12;
+                        vTime = `${String(hour).padStart(2, '0')}:${parts[2]}`;
+                    }
+                    return vTime >= pettyTimeFrom && vTime <= pettyTimeTo;
+                }).sort((a, b) => {
+                    const dateA = normalizePettyVoucherDate(a.isoDate) || normalizePettyVoucherDate(a.date) || '';
+                    const dateB = normalizePettyVoucherDate(b.isoDate) || normalizePettyVoucherDate(b.date) || '';
+                    if (dateA !== dateB) return dateB.localeCompare(dateA);
+                    return String(b.time || '').localeCompare(String(a.time || ''));
                 });
-            }, [pettyVouchers, pettyDateFrom, pettyDateTo, pettyTimeFrom, pettyTimeTo]);
+            }, [pettyVouchers, pettySessions, pettyDateFrom, pettyDateTo, pettyTimeFrom, pettyTimeTo, selectedPettySessionFilter]);
+
+            const getPettySessionDateBounds = (session, vouchers = []) => {
+                const keys = [
+                    normalizePettyVoucherDate(session?.startedAt),
+                    normalizePettyVoucherDate(session?.endedAt),
+                    normalizePettyVoucherDate(session?.date),
+                    ...vouchers.map(v => normalizePettyVoucherDate(v.isoDate) || normalizePettyVoucherDate(v.date) || normalizePettyVoucherDate(v.createdAt))
+                ].filter(Boolean).sort();
+                return keys.length ? { from: keys[0], to: keys[keys.length - 1] } : { from: '', to: '' };
+            };
+
+            const mergePettySessionRecords = (first = [], second = []) => {
+                const byId = new Map();
+                [...(Array.isArray(first) ? first : []), ...(Array.isArray(second) ? second : [])].forEach(item => {
+                    if (!item || !item.id) return;
+                    const previous = byId.get(String(item.id));
+                    // Prefer the record with the newest end timestamp and retain voucher data
+                    // if one stale copy has an empty vouchers array.
+                    if (!previous) byId.set(String(item.id), item);
+                    else {
+                        const newer = String(item.endedAt || item.updatedAt || '') >= String(previous.endedAt || previous.updatedAt || '') ? item : previous;
+                        const older = newer === item ? previous : item;
+                        byId.set(String(item.id), {
+                            ...older,
+                            ...newer,
+                            vouchers: (Array.isArray(newer.vouchers) && newer.vouchers.length) ? newer.vouchers : (Array.isArray(older.vouchers) ? older.vouchers : [])
+                        });
+                    }
+                });
+                return Array.from(byId.values());
+            };
+
+            const filteredPettySessions = useMemo(() => {
+                // Include the durable local archive as well as React state. This prevents
+                // a stale cloud response from temporarily hiding a report just ended.
+                let localReports = [];
+                try { localReports = JSON.parse(localStorage.getItem('app_petty_sessions') || '[]'); } catch (_) {}
+                return mergePettySessionRecords(pettySessions, localReports)
+                    .filter(session => session && session.status !== 'active' && !!session.endedAt)
+                    .sort((a, b) => String(b.endedAt || b.startedAt || b.date || '')
+                        .localeCompare(String(a.endedAt || a.startedAt || a.date || '')));
+            }, [pettySessions]);
+
+            const selectedPettySessionRecord = selectedPettySessionFilter === 'all'
+                ? null
+                : (pettySessions.find(session => String(session.id) === String(selectedPettySessionFilter)) || null);
+            const visiblePettyOpeningAmount = activePettySessionId && (selectedPettySessionFilter === 'all' || selectedPettySessionFilter === activePettySessionId)
+                ? (activePettySessionOpening || currentPettyOpenAmount)
+                : (selectedPettySessionRecord ? selectedPettySessionRecord.openingAmount : currentPettyOpenAmount);
+            const visiblePettyTopUps = activePettySessionId && (selectedPettySessionFilter === 'all' || selectedPettySessionFilter === activePettySessionId)
+                ? activePettyTopUps
+                : (selectedPettySessionRecord?.topUps || []);
+            const totalPettyTopUps = visiblePettyTopUps.reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
+
+            const openPettySessionReport = (session) => {
+                if (!session) return;
+                const bounds = getPettySessionDateBounds(session, session.vouchers || []);
+                if (bounds.from) setPettyDateFrom(bounds.from);
+                if (bounds.to) setPettyDateTo(bounds.to);
+                setPettyTimeFrom('00:00');
+                setPettyTimeTo('23:59');
+                setSelectedPettySessionFilter(String(session.id));
+                setSelectedPettyReport(session);
+            };
+            const loadPettySessionVouchers = (session) => {
+                if (!session) return;
+                const bounds = getPettySessionDateBounds(session, session.vouchers || []);
+                if (bounds.from) setPettyDateFrom(bounds.from);
+                if (bounds.to) setPettyDateTo(bounds.to);
+                setPettyTimeFrom('00:00');
+                setPettyTimeTo('23:59');
+                setSelectedPettySessionFilter(String(session.id));
+                setSelectedPettyReport(null);
+                showToast(`Session ${session.id} vouchers loaded into Issued Vouchers List.`);
+            };
 
             const [currentUserProfile, setCurrentUserProfile] = useState(null);
             const [selectedLoginStaff, setSelectedLoginStaff] = useState('USR001');
@@ -1100,9 +1244,40 @@
                     setCbDenoms({ 5000: '', 2000: '', 1000: '', 500: '', 100: '', 50: '', 20: '', 10: '', 5: '', 2: '', 1: '' });
                     showToast('Cashier Balance Sheet reset successfully! (You can restore it if needed)', 'info');
                 } else if (target === 'petty') {
+                    // Preserve the vouchers being cleared as permanent Audit Trail records.
+                    // The Audit Report must remain available even after the Petty Cash sheet is reset.
+                    const pettyVouchersToArchive = (Array.isArray(pettyVouchers) ? pettyVouchers : []).filter(v => {
+                        const vDate = v.isoDate || (v.date ? new Date(v.date).toISOString().split('T')[0] : '');
+                        return vDate >= pettyDateFrom && vDate <= pettyDateTo;
+                    });
+                    if (pettyVouchersToArchive.length) {
+                        const existingIds = new Set((Array.isArray(historyLogs) ? historyLogs : []).map(log => String(log.id)));
+                        const auditSnapshots = pettyVouchersToArchive
+                            .filter(v => !existingIds.has(String(v.id)))
+                            .map(v => ({
+                                id: v.id,
+                                sourceTab: 'pettyCash',
+                                date: v.isoDate || (v.date ? new Date(v.date).toISOString().split('T')[0] : ''),
+                                shift: v.category || 'Petty Cash',
+                                cashier: v.cashier || 'Admin',
+                                pettyPayee: v.payee || '',
+                                pettyReason: v.reason || '',
+                                pettyAmount: Number(v.amount) || 0,
+                                docExpected: 0, docPhysical: 0, docVariance: 0,
+                                cbCashExpected: 0, cbPhysical: 0, cbVariance: 0,
+                                timestamp: `${v.date || ''} ${v.time || ''}`.trim(),
+                                sessionId: v.sessionId || ''
+                            }));
+                        if (auditSnapshots.length) {
+                            const updatedLogs = [...auditSnapshots, ...(Array.isArray(historyLogs) ? historyLogs : [])];
+                            setHistoryLogs(updatedLogs);
+                            localStorage.setItem('app_history_logs', JSON.stringify(updatedLogs));
+                            syncToCloud({ historyLogs: updatedLogs });
+                        }
+                    }
                     setPettyVouchers(prev => {
                         const updated = prev.filter(v => {
-                            const vDate = v.isoDate || new Date(v.date).toISOString().split('T')[0];
+                            const vDate = v.isoDate || (v.date ? new Date(v.date).toISOString().split('T')[0] : '');
                             return vDate < pettyDateFrom || vDate > pettyDateTo;
                         });
                         localStorage.setItem('app_petty_vouchers', JSON.stringify(updated));
@@ -1174,7 +1349,19 @@
             const [cbDenoms, setCbDenoms] = useState({ 5000: '', 2000: '', 1000: '', 500: '', 100: '', 50: '', 20: '', 10: '', 5: '', 2: '', 1: '' });
 
             const totalPettyCashAmount = useMemo(() => filteredPettyVouchers.reduce((sum, v) => sum + (Number(v.amount) || 0), 0), [filteredPettyVouchers]);
-            const remainingPettyBalance = useMemo(() => (parseFloat(currentPettyOpenAmount) || 0) - totalPettyCashAmount, [currentPettyOpenAmount, totalPettyCashAmount]);
+            // Live dashboard figures belong only to the currently active session.
+            // Historical vouchers stay in reports and the voucher list, not in live cards.
+            const activeSessionPettyVouchers = useMemo(() => activePettySessionId
+                ? pettyVouchers.filter(v => String(v.sessionId || '') === String(activePettySessionId))
+                : [], [pettyVouchers, activePettySessionId]);
+            const livePettyCashAvailable = activePettySessionId
+                ? Number(activePettySessionOpening || currentPettyOpenAmount || 0) + activePettyTopUps.reduce((sum, item) => sum + (Number(item.amount) || 0), 0)
+                : 0;
+            const livePettyVouchersPaid = activePettySessionId
+                ? activeSessionPettyVouchers.reduce((sum, v) => sum + (Number(v.amount) || 0), 0)
+                : 0;
+            const livePettyRemainingCash = activePettySessionId ? livePettyCashAvailable - livePettyVouchersPaid : 0;
+            const remainingPettyBalance = useMemo(() => (parseFloat(visiblePettyOpeningAmount) || 0) + totalPettyTopUps - totalPettyCashAmount, [visiblePettyOpeningAmount, totalPettyTopUps, totalPettyCashAmount]);
             const totalExtraCollections = useMemo(() => extraCollections.reduce((sum, item) => sum + (Number(item.amount) || 0), 0), [extraCollections]);
             const totalOtherPayments = useMemo(() => otherPayments.filter(item => !item.cancelled).reduce((sum, item) => sum + (Number(item.amount) || 0), 0), [otherPayments]);
 
@@ -1631,6 +1818,11 @@
                                         <td style="padding: 8px 6px; text-align: center; font-family: monospace; font-size: 12px; color: #000000;">${cbTotalCashExpected.toFixed(2)}</td>
                                         <td style="padding: 8px 6px; text-align: center; font-family: monospace; font-size: 12px; color: #000000;">${cbTotalCardExpected.toFixed(2)}</td>
                                     </tr>
+                                    <tr style="border-top: 1px solid #000000; background: #ffffff; font-weight: 900;">
+                                        <td style="padding: 7px 10px;">${t.cardSettlement}</td>
+                                        <td style="padding: 7px 6px; text-align: center;">-</td>
+                                        <td style="padding: 7px 6px; text-align: center; font-family: monospace;">Rs. ${(parseFloat(cbCardSettlement) || 0).toFixed(2)}</td>
+                                    </tr>
                                 </tbody>
                             </table>
                             <div style="border: 2px solid #000000; border-radius: 6px; padding: 12px; margin-top: 12px; background: #ffffff; color: #000000;">
@@ -1649,14 +1841,14 @@
 
             const handleExportPettyVouchers = () => {
                 const esc = value => `"${String(value ?? '').replaceAll('\"','\"\"')}"`;
-                const lines = filteredPettyVouchers.map(v => [v.isoDate || v.date, v.time || '', v.id, v.payee, v.category, v.reason, Number(v.amount).toFixed(2), v.cashier || ''].map(esc).join(',')).join('\n');
-                const csv = `Date,Time,Voucher,Payee,Category,Reason,Amount,Cashier\n${lines}\n\nDate From,${esc(pettyDateFrom)}\nDate To,${esc(pettyDateTo)}\nTime From,${esc(pettyTimeFrom)}\nTime To,${esc(pettyTimeTo)}\nTotal Expenses,${esc(totalPettyCashAmount.toFixed(2))}`;
+                const lines = filteredPettyVouchers.map(v => [v.isoDate || v.date, v.time || '', v.sessionId || 'Legacy / No Session ID', v.id, v.payee, v.category, v.reason, Number(v.amount).toFixed(2), v.cashier || ''].map(esc).join(',')).join('\n');
+                const csv = `Date,Time,Session ID,Voucher,Payee,Category,Reason,Amount,Cashier\n${lines}\n\nDate From,${esc(pettyDateFrom)}\nDate To,${esc(pettyDateTo)}\nTime From,${esc(pettyTimeFrom)}\nTime To,${esc(pettyTimeTo)}\nTotal Expenses,${esc(totalPettyCashAmount.toFixed(2))}`;
                 const blob = new Blob(['\ufeff' + csv], {type:'text/csv;charset=utf-8;'});
                 const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `Petty_Cash_Vouchers_${pettyDateFrom}_to_${pettyDateTo}_${pettyTimeFrom.replace(':','')}-${pettyTimeTo.replace(':','')}.csv`; a.click(); URL.revokeObjectURL(url);
             };
 
             const handlePettyPrint = () => {
-                const openVal = parseFloat(currentPettyOpenAmount) || 0;
+                const openVal = (parseFloat(visiblePettyOpeningAmount) || 0) + totalPettyTopUps;
                 const dateLabel = pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} to ${pettyDateTo}`;
                 const timeLabel = `${pettyTimeFrom} to ${pettyTimeTo}`;
                 const html = `
@@ -1665,7 +1857,7 @@
                     </div>
                     <div style="display:flex; justify-content:space-between; gap:12px; margin-bottom:14px; font-size:12px; font-weight:900;">
                         <div style="flex:1; border:2px solid #000000; padding:8px 12px; border-radius:6px; background:#ffffff;">
-                            <div style="font-size:10px; text-transform:uppercase;">PETTY CASH OPEN AMOUNT (FLOAT):</div>
+                            <div style="font-size:10px; text-transform:uppercase;">TOTAL CASH AVAILABLE (OPENING + ADDITIONAL):</div>
                             <div style="font-size:15px; font-family:monospace; margin-top:2px;">Rs. ${openVal.toFixed(2)}</div>
                         </div>
                         <div style="flex:1; border:2px solid #000000; padding:8px 12px; border-radius:6px; background:#ffffff;">
@@ -1891,6 +2083,50 @@
                 showToast(`Print settings for ${tabKey} updated & synced to cloud!`);
             };
 
+            const handlePrintPettySessionReport = (session) => {
+                if (!session) return;
+                const esc = value => String(value ?? '').replace(/[&<>\"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[ch]));
+                const amount = value => {
+                    if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+                    const parsed = Number(String(value ?? '').replace(/,/g, '').replace(/[^0-9.-]/g, ''));
+                    return Number.isFinite(parsed) ? parsed : 0;
+                };
+                const money = value => amount(value).toLocaleString('en-LK', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                const sessionTopUps = Array.isArray(session.topUps) ? session.topUps : [];
+                const sessionVouchers = Array.isArray(session.vouchers) ? session.vouchers : [];
+                const openingTotal = amount(session.openingAmount);
+                const additionalTotal = sessionTopUps.reduce((sum, item) => sum + amount(item.amount), 0);
+                const expensesTotal = sessionVouchers.reduce((sum, item) => sum + amount(item.amount), 0);
+                const cashTotal = openingTotal + additionalTotal;
+                const closingTotal = cashTotal - expensesTotal;
+                const rows = sessionVouchers.map(v => `<tr><td>${esc(v.date || v.isoDate || '')}</td><td>${esc(v.id || '')}</td><td>${esc(v.payee || '')}</td><td>${esc(v.category || '')}</td><td>${esc(v.reason || '')}</td><td class="amount">${money(v.amount)}</td></tr>`).join('');
+                const topUpRows = sessionTopUps.map(item => `<tr><td>${esc(item.date || '')}</td><td>${esc(item.time || '')}</td><td>${esc(item.addedBy || '')}</td><td class="amount">${money(item.amount)}</td></tr>`).join('');
+                const html = `<!doctype html><html><head><meta charset="utf-8"><title>Petty Cash Session ${esc(session.id)}</title><style>
+                    *{box-sizing:border-box}body{font-family:Arial,sans-serif;padding:24px;color:#111;font-size:12px}h2{text-align:center;margin:0 0 6px;font-size:20px}.meta{text-align:center;font-size:11px;margin-bottom:18px;line-height:1.6}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:14px 0 20px}.summary div{border:1px solid #777;padding:10px 6px;text-align:center;font-size:11px}.summary b{display:block;font-size:14px;margin-top:5px}.section-title{font-size:13px;margin:18px 0 7px;font-weight:700}table{width:100%;border-collapse:collapse;font-size:10.5px}th,td{border:1px solid #555;padding:7px 6px}th{background:#eee;text-align:left}.amount{text-align:right;white-space:nowrap}.total-row th{background:#e8eef5;font-weight:800}.sign{display:flex;justify-content:space-around;gap:24px;margin-top:55px}.sign span{border-top:1px solid #111;padding:8px 30px;text-align:center;min-width:150px}@media print{body{padding:0}.summary div,th,.total-row th{-webkit-print-color-adjust:exact;print-color-adjust:exact}thead{display:table-header-group}tr{page-break-inside:avoid}}
+                    </style></head><body>
+                    <h2>PETTY CASH SESSION REPORT</h2>
+                    <div class="meta">Session: ${esc(session.id)} · Date: ${esc(session.date)}<br>Started: ${esc(session.startedAt || '—')} · Ended: ${esc(session.endedAt || '—')}</div>
+                    <div class="summary">
+                        <div>Total Cash Available<b>Rs. ${money(cashTotal)}</b></div>
+                        <div>Additional Cash<b>Rs. ${money(additionalTotal)}</b></div>
+                        <div>Total Expenses<b>Rs. ${money(expensesTotal)}</b></div>
+                        <div>Closing Balance<b>Rs. ${money(closingTotal)}</b></div>
+                    </div>
+                    <div class="section-title">ADDITIONAL CASH RECEIVED</div>
+                    <table><thead><tr><th>Date</th><th>Time</th><th>Added By</th><th class="amount">Amount (Rs.)</th></tr></thead><tbody>
+                    ${topUpRows || '<tr><td colspan="4" style="text-align:center">No additional cash added</td></tr>'}
+                    <tr class="total-row"><th colspan="3" class="amount">TOTAL ADDITIONAL CASH</th><th class="amount">${money(additionalTotal)}</th></tr></tbody></table>
+                    <div class="section-title">EXPENSE VOUCHERS</div>
+                    <table><thead><tr><th>Date</th><th>Voucher</th><th>Payee</th><th>Category</th><th>Reason</th><th class="amount">Amount (Rs.)</th></tr></thead><tbody>
+                    ${rows || '<tr><td colspan="6" style="text-align:center">No vouchers</td></tr>'}
+                    <tr class="total-row"><th colspan="5" class="amount">TOTAL EXPENSES</th><th class="amount">${money(expensesTotal)}</th></tr></tbody></table>
+                    <div class="sign"><span>Prepared By</span><span>Checked By</span><span>Approved By</span></div>
+                    <script>window.onload=()=>window.print()<\/script></body></html>`;
+                const win = window.open('', '_blank');
+                if (!win) return showToast('Please allow pop-ups to print the session report.', 'error');
+                win.document.open(); win.document.write(html); win.document.close();
+            };
+
             const handleAddPettyVoucher = (e) => {
                 e.preventDefault();
                 if (!activePettySessionId) return showToast('Start a new Petty Cash session first.', 'error');
@@ -1918,6 +2154,63 @@
                 showToast(`Petty Cash voucher created & synced online for ${pettyDateTo}!`);
             };
 
+            const handleUpdateActivePettyOpening = () => {
+                if (!activePettySessionId) return showToast('No active Petty Cash session.', 'error');
+                const desiredTotal = Number(editPettyOpeningAmount);
+                if (editPettyOpeningAmount === '' || !Number.isFinite(desiredTotal) || desiredTotal < 0) return showToast('Enter a valid Total Cash Available amount.', 'error');
+                const topUpTotal = (activePettyTopUps || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
+                if (desiredTotal < topUpTotal) return showToast(`Total must be at least Rs. ${topUpTotal.toFixed(2)} because that amount is already recorded under Add More Cash. Use Clear Total Cash if you need to remove all available cash.`, 'error');
+                const openingAmount = (desiredTotal - topUpTotal).toFixed(2);
+                setActivePettySessionOpening(openingAmount);
+                localStorage.setItem('app_petty_active_session_opening', openingAmount);
+                const started = activePettySessionStartedAt || localStorage.getItem('app_petty_active_session_started') || '';
+                const d = new Date(started);
+                const dateKey = started && !Number.isNaN(d.getTime()) ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : new Date().toISOString().slice(0, 10);
+                setPettyDailyFloats(prev => {
+                    const updated = { ...prev, [dateKey]: openingAmount };
+                    localStorage.setItem('app_petty_daily_floats', JSON.stringify(updated));
+                    syncToCloud({ pettyDailyFloats: updated });
+                    return updated;
+                });
+                syncToCloud({ activePettySessionId, activePettySessionOpening: openingAmount });
+                setEditPettyOpeningAmount('');
+                showToast(`Total Cash Available updated to Rs. ${desiredTotal.toFixed(2)}. Existing vouchers were kept unchanged.`);
+            };
+
+            const handleClearActivePettyCash = () => {
+                if (!activePettySessionId) return showToast('No active Petty Cash session.', 'error');
+                const clearedTopUps = [];
+                setActivePettySessionOpening('0.00');
+                setActivePettyTopUps(clearedTopUps);
+                localStorage.setItem('app_petty_active_session_opening', '0.00');
+                localStorage.setItem('app_petty_active_topups', JSON.stringify(clearedTopUps));
+                const started = activePettySessionStartedAt || localStorage.getItem('app_petty_active_session_started') || '';
+                const d = new Date(started);
+                const dateKey = started && !Number.isNaN(d.getTime()) ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : new Date().toISOString().slice(0, 10);
+                setPettyDailyFloats(prev => {
+                    const updated = { ...prev, [dateKey]: '0.00' };
+                    localStorage.setItem('app_petty_daily_floats', JSON.stringify(updated));
+                    syncToCloud({ pettyDailyFloats: updated });
+                    return updated;
+                });
+                syncToCloud({ activePettySessionId, activePettySessionOpening: '0.00', activePettyTopUps: clearedTopUps });
+                setEditPettyOpeningAmount('');
+                showToast('Total Cash Available cleared to Rs. 0.00. All existing vouchers were kept unchanged.');
+            };
+
+            const handleAddPettyTopUp = () => {
+                if (!activePettySessionId) return showToast('Start or reopen a Petty Cash session first.', 'error');
+                const amount = Number(newPettyTopUpAmount);
+                if (!newPettyTopUpAmount || !Number.isFinite(amount) || amount <= 0) return showToast('Enter a valid additional cash amount.', 'error');
+                const entry = { id: 'PCT-' + Date.now(), amount, date: new Date().toISOString().slice(0,10), time: new Date().toLocaleTimeString(), addedBy: currentUserProfile?.name || 'Admin' };
+                const updated = [...activePettyTopUps, entry];
+                setActivePettyTopUps(updated);
+                localStorage.setItem('app_petty_active_topups', JSON.stringify(updated));
+                syncToCloud({ activePettyTopUps: updated, activePettySessionId });
+                setNewPettyTopUpAmount('');
+                showToast(`Rs. ${amount.toFixed(2)} added to this Petty Cash session.`);
+            };
+
             const handleEndPettySession = () => {
                 if (!activePettySessionId) return showToast('No active Petty Cash session.', 'error');
                 setPettySessionConfirm({
@@ -1937,10 +2230,20 @@
 
             const handleReopenPettySession = (session) => {
                 if (activePettySessionId) return showToast('End the currently active session before reopening another one.', 'error');
+                if (!session || session.status === 'active' || !session.endedAt) return showToast('Only an ended session can be reopened.', 'error');
                 setPettySessionConfirm({
                     isOpen: true, action: 'reopen', session,
                     title: '↩️ Reopen This Petty Cash Session?',
                     message: `You are about to reopen ${session.id}. Its existing vouchers and opening amount will be kept. You can add more vouchers, then end the session again to update its report.`
+                });
+            };
+
+            const handleDeletePettySession = (session) => {
+                if (!session || session.id === activePettySessionId || session.status === 'active') return showToast('An active Petty Cash session cannot be deleted. End it first.', 'error');
+                setPettySessionConfirm({
+                    isOpen: true, action: 'delete', session,
+                    title: '🗑️ Delete Petty Cash Session?',
+                    message: `Delete session ${session.id} and its saved report and linked vouchers? This cannot be undone.`
                 });
             };
 
@@ -1957,17 +2260,20 @@
                     const sessionDateKey = `${sessionStartDate.getFullYear()}-${String(sessionStartDate.getMonth() + 1).padStart(2, '0')}-${String(sessionStartDate.getDate()).padStart(2, '0')}`;
                     setPettyDateFrom(sessionDateKey);
                     setPettyDateTo(sessionDateKey);
+                    setSelectedPettySessionFilter(nextId);
                     setPettyTimeFrom('00:00');
                     setPettyTimeTo('23:59');
                     setSelectedPettyReport(null);
                     setPettyDailyFloats(prev => {
-                        const updated = { ...prev, [pettyDateTo]: amount.toFixed(2) };
+                        const updated = { ...prev, [sessionDateKey]: amount.toFixed(2) };
                         localStorage.setItem('app_petty_daily_floats', JSON.stringify(updated));
                         syncToCloud({ pettyDailyFloats: updated });
                         return updated;
                     });
                     setActivePettySessionId(nextId);
                     setActivePettySessionOpening(amount.toFixed(2));
+                    setActivePettyTopUps([]);
+                    localStorage.setItem('app_petty_active_topups', '[]');
                     localStorage.setItem('app_petty_active_session', nextId);
                     localStorage.setItem('app_petty_active_session_opening', amount.toFixed(2));
                     const startedAt = new Date().toLocaleString();
@@ -1978,39 +2284,93 @@
                     showToast('New Petty Cash session started.');
                     return;
                 }
+                if (action === 'delete' && session) {
+                    if (session.id === activePettySessionId || session.status === 'active') return showToast('An active Petty Cash session cannot be deleted.', 'error');
+                    setPettySessions(prev => {
+                        const updated = prev.filter(item => String(item.id) !== String(session.id));
+                        localStorage.setItem('app_petty_sessions', JSON.stringify(updated));
+                        syncToCloud({ pettySessions: updated });
+                        return updated;
+                    });
+                    setPettyVouchers(prev => {
+                        const updated = prev.filter(v => String(v.sessionId || '') !== String(session.id));
+                        localStorage.setItem('app_petty_vouchers', JSON.stringify(updated));
+                        syncToCloud({ pettyVouchers: updated });
+                        return updated;
+                    });
+                    if (selectedPettyReport && String(selectedPettyReport.id) === String(session.id)) setSelectedPettyReport(null);
+                    showToast('Petty Cash session, report and linked vouchers deleted.');
+                    return;
+                }
                 if (action === 'end') {
                     // Include only vouchers explicitly assigned to this session.
                     // The old fallback for vouchers without a sessionId pulled legacy
                     // vouchers into every later session and mixed the reports together.
                     const sessionVouchers = pettyVouchers.filter(v => String(v.sessionId || '') === String(activePettySessionId));
                     const opening = Number(activePettySessionOpening !== '' ? activePettySessionOpening : currentPettyOpenAmount) || 0;
-                    if (!sessionVouchers.length && opening === 0) return showToast('Add an opening amount or voucher before ending the session.', 'error');
+                    // Allow ending even a zero-opening/zero-voucher session. A session
+                    // must always be closable by the cashier; its report can legitimately be zero.
                     const expenses = sessionVouchers.reduce((sum, v) => sum + (Number(v.amount) || 0), 0);
+                    const sessionEndedAt = new Date().toLocaleString();
                     const archived = {
                         id: activePettySessionId,
-                        date: (() => { const d = new Date(activePettySessionStartedAt || Date.now()); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })(),
+                        date: normalizePettyVoucherDate(activePettySessionStartedAt || Date.now()) || new Date().toISOString().split('T')[0],
                         startedAt: activePettySessionStartedAt || localStorage.getItem('app_petty_active_session_started') || '',
-                        endedAt: new Date().toLocaleString(),
+                        endedAt: sessionEndedAt,
                         openingAmount: opening,
+                        topUps: activePettyTopUps,
+                        totalAdditionalFunds: activePettyTopUps.reduce((sum, item) => sum + (Number(item.amount) || 0), 0),
                         totalExpenses: expenses,
-                        closingBalance: opening - expenses,
+                        closingBalance: opening + activePettyTopUps.reduce((sum, item) => sum + (Number(item.amount) || 0), 0) - expenses,
                         vouchers: sessionVouchers,
                         status: 'closed'
                     };
-                    setPettySessions(prev => {
-                        const updated = [archived, ...prev.filter(item => item.id !== archived.id)];
-                        localStorage.setItem('app_petty_sessions', JSON.stringify(updated));
-                        syncToCloud({ pettySessions: updated });
-                        return updated;
-                    });
-                    setSelectedPettyReport(archived);
+                    // Persist the closed report synchronously before clearing active-session
+                    // state. This prevents a stale React/cloud snapshot from hiding the report
+                    // immediately after End Session is clicked.
+                    let savedSessions = [];
+                    try {
+                        const rawSessions = JSON.parse(localStorage.getItem('app_petty_sessions') || '[]');
+                        if (Array.isArray(rawSessions)) savedSessions = rawSessions;
+                    } catch (_) { savedSessions = []; }
+                    const updatedSessions = [archived, ...savedSessions.filter(item => String(item.id) !== String(archived.id))];
+                    localStorage.setItem('app_petty_sessions', JSON.stringify(updatedSessions));
+                    setPettySessions(updatedSessions);
+                    const endedBounds = getPettySessionDateBounds(archived, sessionVouchers);
+                    if (endedBounds.from) setPettyDateFrom(endedBounds.from);
+                    if (endedBounds.to) setPettyDateTo(endedBounds.to);
+                    setSelectedPettySessionFilter('none');
+                    setSelectedPettyReport(null);
+                    // Reset the live session values, while keeping the complete archived
+                    // report. Persist the final state together so an older React snapshot
+                    // cannot overwrite the just-ended session in Firestore.
+                    const endedSessionDate = normalizePettyVoucherDate(archived.startedAt || archived.date) || new Date().toISOString().slice(0, 10);
+                    let updatedDailyFloats = pettyDailyFloats;
+                    try {
+                        const rawFloats = JSON.parse(localStorage.getItem('app_petty_daily_floats') || '{}');
+                        updatedDailyFloats = { ...(rawFloats && typeof rawFloats === 'object' ? rawFloats : {}), [endedSessionDate]: '0.00' };
+                    } catch (_) { updatedDailyFloats = { [endedSessionDate]: '0.00' }; }
+                    localStorage.setItem('app_petty_daily_floats', JSON.stringify(updatedDailyFloats));
+                    setPettyDailyFloats(updatedDailyFloats);
                     setActivePettySessionId('');
                     setActivePettySessionOpening('');
+                    setActivePettyTopUps([]);
                     setActivePettySessionStartedAt('');
-                    localStorage.removeItem('app_petty_active_session');
+                    localStorage.setItem('app_petty_active_session', '__closed__');
                     localStorage.removeItem('app_petty_active_session_opening');
                     localStorage.removeItem('app_petty_active_session_started');
-                    syncToCloud({ activePettySessionId: '', activePettySessionOpening: '', activePettySessionStartedAt: '' });
+                    localStorage.removeItem('app_petty_active_topups');
+                    // One authoritative cloud write includes BOTH the closed report and
+                    // every cleared active-session field, avoiding stale-snapshot races.
+                    syncToCloud({
+                        pettySessions: updatedSessions,
+                        pettyDailyFloats: updatedDailyFloats,
+                        activePettySessionId: '',
+                        activePettySessionOpening: '',
+                        activePettySessionStartedAt: '',
+                        activePettyTopUps: []
+                    });
+                    setSelectedPettyReport(archived);
                     showToast('Petty Cash session ended. Report saved successfully.');
                     return;
                 }
@@ -2021,17 +2381,11 @@
                     // voucher records still exist; an empty array must not hide those records.
                     const archivedVouchers = Array.isArray(session.vouchers) ? session.vouchers : [];
                     const liveSessionVouchers = pettyVouchers.filter(v => String(v.sessionId || '') === String(session.id));
-                    const legacyDateVouchers = pettyVouchers.filter(v => {
-                        if (v.sessionId) return false;
-                        const rawDate = v.isoDate || v.date || '';
-                        const parsed = new Date(rawDate);
-                        const normalized = /^\d{4}-\d{2}-\d{2}$/.test(String(rawDate))
-                            ? String(rawDate)
-                            : (!Number.isNaN(parsed.getTime()) ? parsed.toISOString().split('T')[0] : '');
-                        return normalized && session.date && normalized === session.date;
-                    });
+                    // Never claim unassigned vouchers merely because they share a calendar date:
+                    // an overnight session can overlap another session on that same date.
+                    // Only archived vouchers and live vouchers explicitly linked to this ID belong here.
                     const voucherById = new Map();
-                    [...archivedVouchers, ...liveSessionVouchers, ...legacyDateVouchers].forEach((v, index) => {
+                    [...archivedVouchers, ...liveSessionVouchers].forEach((v, index) => {
                         const key = v.id || `${session.id}-recovered-${index}`;
                         voucherById.set(key, { ...v, sessionId: v.sessionId || session.id });
                     });
@@ -2052,19 +2406,23 @@
                         const parsed = new Date(rawDate);
                         return Number.isNaN(parsed.getTime()) ? session.date : parsed.toISOString().split('T')[0];
                     }).filter(Boolean).sort();
-                    const restoreFromDate = sessionDates[0] || session.date || new Date().toISOString().split('T')[0];
-                    const restoreToDate = sessionDates[sessionDates.length - 1] || session.date || restoreFromDate;
+                    const sessionBounds = getPettySessionDateBounds(session, savedSessionVouchers);
+                    const restoreFromDate = sessionBounds.from || sessionDates[0] || session.date || new Date().toISOString().split('T')[0];
+                    const restoreToDate = sessionBounds.to || sessionDates[sessionDates.length - 1] || session.date || restoreFromDate;
                     setPettyDateFrom(restoreFromDate);
                     setPettyDateTo(restoreToDate);
+                    setSelectedPettySessionFilter(String(session.id));
                     setPettyTimeFrom('00:00');
                     setPettyTimeTo('23:59');
                     setActivePettySessionId(session.id);
                     setActivePettySessionOpening(String(Number(session.openingAmount || 0).toFixed(2)));
+                    setActivePettyTopUps(Array.isArray(session.topUps) ? session.topUps : []);
+                    localStorage.setItem('app_petty_active_topups', JSON.stringify(Array.isArray(session.topUps) ? session.topUps : []));
                     setActivePettySessionStartedAt(session.startedAt || reopenedAt);
                     localStorage.setItem('app_petty_active_session', session.id);
                     localStorage.setItem('app_petty_active_session_opening', String(Number(session.openingAmount || 0).toFixed(2)));
                     localStorage.setItem('app_petty_active_session_started', session.startedAt || reopenedAt);
-                    syncToCloud({ activePettySessionId: session.id, activePettySessionOpening: String(Number(session.openingAmount || 0).toFixed(2)), activePettySessionStartedAt: session.startedAt || reopenedAt });
+                    syncToCloud({ activePettySessionId: session.id, activePettySessionOpening: String(Number(session.openingAmount || 0).toFixed(2)), activePettySessionStartedAt: session.startedAt || reopenedAt, activePettyTopUps: Array.isArray(session.topUps) ? session.topUps : [] });
                     setPettySessions(prev => {
                         const updated = prev.map(item => item.id === session.id ? { ...item, status: 'active', endedAt: '' } : item);
                         localStorage.setItem('app_petty_sessions', JSON.stringify(updated));
@@ -2369,14 +2727,17 @@
                 showToast('Other payment added to Cashier Sheet!');
             };
 
-            // Permanently delete only the selected payment from its sheet and cloud record.
+            // Cancel a payment without deleting its audit record. Cancelled entries are
+            // excluded from totals and active lists, but remain stored for traceability.
             const handleCancelPaymentEntry = (listSetter, cloudKey, id, entryType) => {
                 listSetter(prev => {
-                    const updated = prev.filter(item => item.id !== id);
+                    const updated = prev.map(item => item.id === id
+                        ? { ...item, cancelled: true, cancelledAt: new Date().toLocaleString(), cancelledBy: currentUserProfile?.name || 'Admin' }
+                        : item);
                     syncToCloud({ [cloudKey]: updated });
                     return updated;
                 });
-                showToast(`${entryType} permanently deleted.`, 'info');
+                showToast(`${entryType} cancelled. The record was kept in history.`, 'info');
             };
 
             const renderTrashIcon = () => <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>;
@@ -2802,20 +3163,20 @@
                                                         localStorage.setItem('app_history_logs', JSON.stringify(cloudData.historyLogs));
                                                     }
                                                     if (Array.isArray(cloudData.pettyVouchers)) {
-                                                        const localVouchers = JSON.parse(localStorage.getItem('app_petty_vouchers') || '[]');
-                                                        const mergedMap = new Map();
-                                                        [...cloudData.pettyVouchers, ...(Array.isArray(localVouchers) ? localVouchers : [])].forEach((v, i) => mergedMap.set(v.id || `petty-${i}`, v));
-                                                        const mergedVouchers = Array.from(mergedMap.values());
-                                                        setPettyVouchers(mergedVouchers);
-                                                        localStorage.setItem('app_petty_vouchers', JSON.stringify(mergedVouchers));
+                                                        const cloudVouchers = cloudData.pettyVouchers;
+                                                        setPettyVouchers(cloudVouchers);
+                                                        localStorage.setItem('app_petty_vouchers', JSON.stringify(cloudVouchers));
                                                     }
                                                     if (Array.isArray(cloudData.pettySessions)) {
-                                                        const localSessions = JSON.parse(localStorage.getItem('app_petty_sessions') || '[]');
-                                                        const mergedSessions = new Map();
-                                                        [...cloudData.pettySessions, ...(Array.isArray(localSessions) ? localSessions : [])].forEach((item, i) => mergedSessions.set(item.id || `session-${i}`, item));
-                                                        const mergedSessionList = Array.from(mergedSessions.values());
-                                                        setPettySessions(mergedSessionList);
-                                                        localStorage.setItem('app_petty_sessions', JSON.stringify(mergedSessionList));
+                                                        // Do not let an empty/stale cloud response erase
+                                                        // reports already saved in this browser.
+                                                        let localSessions = [];
+                                                        try { localSessions = JSON.parse(localStorage.getItem('app_petty_sessions') || '[]'); } catch (_) {}
+                                                        const cloudSessions = cloudData.pettySessions;
+                                                        const resolvedSessions = mergePettySessionRecords(cloudSessions, localSessions);
+                                                        setPettySessions(resolvedSessions);
+                                                        localStorage.setItem('app_petty_sessions', JSON.stringify(resolvedSessions));
+                                                        if (JSON.stringify(resolvedSessions) !== JSON.stringify(cloudSessions)) syncToCloud({ pettySessions: resolvedSessions });
                                                     }
                                                     if (cloudData.users) {
                                                         setUsers(cloudData.users);
@@ -3017,14 +3378,14 @@
                             <div className={`${theme.cardBg} ${theme.text} relative overflow-hidden border border-amber-400/50 rounded-3xl p-6 max-w-md w-full shadow-2xl`} onClick={e => e.stopPropagation()}>
                                 <div className="absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r from-amber-400 via-orange-500 to-rose-500"></div>
                                 <div className={`flex items-center gap-3 border-b ${theme.cardBorder} pb-4 mb-4`}>
-                                    <div className="w-12 h-12 rounded-2xl bg-amber-500/15 flex items-center justify-center text-2xl">{pettySessionConfirm.action === 'end' ? '⏹️' : pettySessionConfirm.action === 'reopen' ? '↩️' : '🚀'}</div>
+                                    <div className="w-12 h-12 rounded-2xl bg-amber-500/15 flex items-center justify-center text-2xl">{pettySessionConfirm.action === 'end' ? '⏹️' : pettySessionConfirm.action === 'reopen' ? '↩️' : pettySessionConfirm.action === 'delete' ? '🗑️' : '🚀'}</div>
                                     <div><div className="text-[10px] tracking-[0.2em] font-black text-amber-500 uppercase">Petty Cash Control</div><h3 className="text-base font-extrabold">{pettySessionConfirm.title}</h3></div>
                                 </div>
                                 <p className={`text-sm ${theme.subText} leading-relaxed font-medium`}>{pettySessionConfirm.message}</p>
                                 <div className="mt-5 rounded-2xl bg-amber-500/10 border border-amber-500/20 p-3 text-xs font-semibold text-amber-600">⚠️ Please review the session details before continuing. This action will update the session status.</div>
                                 <div className={`flex justify-end gap-2 pt-5 mt-4 border-t ${theme.cardBorder}`}>
                                     <button type="button" onClick={() => setPettySessionConfirm({ isOpen: false, action: '', session: null, title: '', message: '' })} className="px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white rounded-xl text-xs font-bold">Cancel</button>
-                                    <button type="button" onClick={executePettySessionConfirmation} className="px-4 py-2 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white rounded-xl text-xs font-extrabold shadow-lg">{pettySessionConfirm.action === 'end' ? 'Yes, End Session' : pettySessionConfirm.action === 'reopen' ? 'Yes, Reopen Session' : 'Yes, Start Session'}</button>
+                                    <button type="button" onClick={executePettySessionConfirmation} className="px-4 py-2 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white rounded-xl text-xs font-extrabold shadow-lg">{pettySessionConfirm.action === 'end' ? 'Yes, End Session' : pettySessionConfirm.action === 'reopen' ? 'Yes, Reopen Session' : pettySessionConfirm.action === 'delete' ? 'Yes, Delete Session' : 'Yes, Start Session'}</button>
                                 </div>
                             </div>
                         </div>
@@ -3293,7 +3654,7 @@
                                                     <tr key={payment.id} className="bg-rose-50/80 border-b border-rose-200">
                                                         <td className="p-2 pl-4 text-rose-700 font-semibold flex justify-between items-center">
                                                             <span>{payment.desc || 'Other Payment'}</span>
-                                                            <button onClick={() => handleCancelPaymentEntry(setOtherPayments, 'otherPayments', payment.id, 'Doctor sheet payment')} className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-100 rounded-md transition-colors" title="Delete payment permanently" aria-label="Delete payment">{renderTrashIcon()}</button>
+                                                            <button onClick={() => handleCancelPaymentEntry(setOtherPayments, 'otherPayments', payment.id, 'Doctor sheet payment')} className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-100 rounded-md transition-colors" title="Cancel payment (keep history)" aria-label="Cancel payment">{renderTrashIcon()}</button>
                                                         </td>
                                                         <td className="p-1 text-right font-mono font-bold text-rose-700">{Number(payment.amount).toFixed(2)}</td>
                                                     </tr>
@@ -3432,7 +3793,7 @@
                                                     <tr key={dv.id} className="bg-rose-50/80">
                                                         <td className="p-2 pl-6 text-rose-700 font-semibold flex justify-between items-center">
                                                             <span>{dv.desc}</span>
-                                                            <button onClick={() => handleCancelPaymentEntry(setCbDocVouchersList, 'cbDocVouchersList', dv.id, 'Doctor voucher')} className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-100 rounded-md transition-colors ml-2" title="Delete doctor voucher permanently" aria-label="Delete doctor voucher">{renderTrashIcon()}</button>
+                                                            <button onClick={() => handleCancelPaymentEntry(setCbDocVouchersList, 'cbDocVouchersList', dv.id, 'Doctor voucher')} className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-100 rounded-md transition-colors ml-2" title="Cancel doctor voucher (keep history)" aria-label="Cancel doctor voucher">{renderTrashIcon()}</button>
                                                         </td>
                                                         <td className="p-1 text-center font-mono text-rose-700 font-bold">{Number(dv.amount).toFixed(2)}</td>
                                                         <td className="p-1 text-center text-slate-400">-</td>
@@ -3455,7 +3816,7 @@
                                                     <tr key={op.id} className="bg-amber-50/80">
                                                         <td className="p-2 pl-6 text-amber-800 font-semibold flex justify-between items-center">
                                                             <span>{op.desc} ({op.cashierName})</span>
-                                                            <button onClick={() => handleCancelPaymentEntry(setCbOtherPaymentsList, 'cbOtherPaymentsList', op.id, 'Cashier sheet payment')} className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-100 rounded-md transition-colors ml-2" title="Delete payment permanently" aria-label="Delete payment">{renderTrashIcon()}</button>
+                                                            <button onClick={() => handleCancelPaymentEntry(setCbOtherPaymentsList, 'cbOtherPaymentsList', op.id, 'Cashier sheet payment')} className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-100 rounded-md transition-colors ml-2" title="Cancel payment (keep history)" aria-label="Cancel payment">{renderTrashIcon()}</button>
                                                         </td>
                                                         <td className="p-1 text-center font-mono text-amber-800 font-bold">{Number(op.amount).toFixed(2)}</td>
                                                         <td className="p-1 text-center text-slate-400">-</td>
@@ -3542,6 +3903,14 @@
                                             <input type="time" value={pettyTimeFrom} onChange={e => setPettyTimeFrom(e.target.value)} className="border border-amber-400 rounded-lg px-2 py-0.5 text-xs font-mono font-bold bg-white text-black" />
                                             <span className="text-xs font-extrabold text-amber-600">To:</span>
                                             <input type="time" value={pettyTimeTo} onChange={e => setPettyTimeTo(e.target.value)} className="border border-amber-400 rounded-lg px-2 py-0.5 text-xs font-mono font-bold bg-white text-black" />
+                                            <span className="text-xs font-extrabold text-amber-600">Session:</span>
+                                            <select value={selectedPettySessionFilter} onChange={e => setSelectedPettySessionFilter(e.target.value)} className="border border-amber-400 rounded-lg px-2 py-1 text-xs font-bold bg-white text-black max-w-[190px]">
+                                                <option value="none">No Active Session</option>
+                                                <option value="all">All Sessions</option>
+                                                {activePettySessionId && <option value={activePettySessionId}>{activePettySessionId} (ACTIVE)</option>}
+                                                {pettySessions.filter(session => String(session.id) !== String(activePettySessionId)).map(session => <option key={session.id} value={String(session.id)}>{session.id} ({session.status === 'active' ? 'ACTIVE' : 'ENDED'})</option>)}
+                                                {pettyVouchers.some(v => !v.sessionId) && <option value="legacy">Legacy / No Session ID</option>}
+                                            </select>
                                         </div>
                                     </div>
                                     <div className="flex space-x-2">
@@ -3556,116 +3925,38 @@
                                 </div>
 
                                 {/* Petty Cash Opening Amount & Balance Summary Bar */}
-                                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div className="grid grid-cols-1 md:grid-cols-3 items-start gap-3">
+                                    <div className="flex flex-col gap-3">
                                     <div className={`p-4 rounded-2xl border ${theme.cardBorder} ${theme.inputBg} flex flex-col justify-between`}>
                                         <label className="text-xs font-extrabold text-amber-600 uppercase mb-1.5">
-                                            💰 {pettyDateFrom === pettyDateTo ? `Open Amount for ${pettyDateFrom}` : `Total Open Amount (${pettyDateFrom} to ${pettyDateTo})`} (Rs.)
+                                            💰 {`Total Cash Available (${pettyDateFrom}${pettyDateTo !== pettyDateFrom ? ` to ${pettyDateTo}` : ''})`} (Rs.)
                                         </label>
-                                        <input 
-                                            type="text" inputMode="decimal" onKeyDown={handleKeyDownNavigation} 
-                                            step="0.01" 
-                                            placeholder="0.00" 
-                                            readOnly={pettyDateFrom !== pettyDateTo}
-                                            value={pettyDateFrom === pettyDateTo ? currentPettyOpenAmount : Number(currentPettyOpenAmount).toFixed(2)} 
-                                            onFocus={handleInputFocus} 
-                                            onBlur={e => {
-                                                if (pettyDateFrom === pettyDateTo && e.target.value !== '' && !isNaN(e.target.value)) {
-                                                    const formatted = parseFloat(e.target.value).toFixed(2);
-                                                    if (activePettySessionId) {
-                                                        setActivePettySessionOpening(formatted);
-                                                        localStorage.setItem('app_petty_active_session_opening', formatted);
-                                                        syncToCloud({ activePettySessionId, activePettySessionOpening: formatted, activePettySessionStartedAt });
-                                                    } else {
-                                                        setPettyDailyFloats(prev => {
-                                                            const updated = { ...prev, [pettyDateFrom]: formatted };
-                                                            localStorage.setItem('app_petty_daily_floats', JSON.stringify(updated));
-                                                            return updated;
-                                                        });
-                                                    }
-                                                }
-                                            }}
-                                            onChange={e => {
-                                                if (pettyDateFrom === pettyDateTo) {
-                                                    const val = e.target.value;
-                                                    if (activePettySessionId) {
-                                                        setActivePettySessionOpening(val);
-                                                    } else {
-                                                        setPettyDailyFloats(prev => {
-                                                            const updated = { ...prev, [pettyDateFrom]: val };
-                                                            localStorage.setItem('app_petty_daily_floats', JSON.stringify(updated));
-                                                            return updated;
-                                                        });
-                                                    }
-                                                }
-                                            }} 
-                                            className={`w-full ${pettyDateFrom !== pettyDateTo ? 'bg-slate-200 cursor-not-allowed' : theme.cardBg} border-2 border-amber-400 rounded-xl px-3 py-2 font-mono text-base font-black text-black text-center shadow-sm`} 
+                                        <input
+                                            type="text" inputMode="decimal" value={livePettyCashAvailable.toFixed(2)}
+                                            readOnly={true}
+                                            className={`w-full bg-slate-100 cursor-not-allowed border-2 border-amber-400 rounded-xl px-3 py-2 font-mono text-base font-black text-black text-center shadow-sm`}
+                                            title="Total cash available includes the opening amount plus all additional cash added to this session."
                                         />
-                                    </div>
-                                    <div className={`p-4 rounded-2xl border ${theme.cardBorder} ${theme.inputBg} flex flex-col justify-center items-center`}>
-                                        <span className="text-xs font-extrabold text-rose-500 uppercase">📉 Vouchers Paid ({pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} - ${pettyDateTo}`})</span>
-                                        <span className="font-mono text-xl font-black text-rose-600 mt-1">Rs. {totalPettyCashAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
-                                    </div>
-                                    <div className={`p-4 rounded-2xl border-2 ${remainingPettyBalance < 0 ? 'border-rose-500 bg-rose-500/10' : 'border-emerald-500 bg-emerald-500/10'} flex flex-col justify-center items-center`}>
-                                        <span className={`text-xs font-extrabold uppercase ${remainingPettyBalance < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>🏦 Remaining Cash ({pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} - ${pettyDateTo}`})</span>
-                                        <span className={`font-mono text-xl font-black mt-1 ${remainingPettyBalance < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>Rs. {remainingPettyBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
-                                    </div>
-                                </div>
 
-                                <div className={`mt-4 p-4 rounded-2xl border ${theme.cardBorder} ${theme.inputBg} space-y-3`}>
-                                    <div className="flex flex-wrap items-center justify-between gap-3">
-                                        <div>
-                                            <div className="font-extrabold text-sm">Petty Cash Session</div>
-                                            <div className={`text-xs ${theme.subText}`}>{activePettySessionId ? `Active Session: ${activePettySessionId} · Opening: Rs. ${Number(activePettySessionOpening || currentPettyOpenAmount || 0).toFixed(2)} · Started: ${activePettySessionStartedAt || localStorage.getItem('app_petty_active_session_started') || '—'}` : 'No active session — start a new session to enter vouchers.'}</div>
-                                        </div>
-                                        {activePettySessionId ? (
-                                            <button onClick={handleEndPettySession} className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold">⏹ End Session & Save Report</button>
-                                        ) : (
-                                            <div className="flex flex-wrap gap-2 items-center">
-                                                <input type="text" inputMode="decimal" onKeyDown={handleKeyDownNavigation} min="0" step="0.01" placeholder="New opening amount (Rs.)" value={newPettySessionAmount} onChange={e => setNewPettySessionAmount(e.target.value)} onBlur={e => formatCurrencyBlur(e.target.value, setNewPettySessionAmount)} className="border rounded-lg px-3 py-2 text-sm w-52" />
-                                                <button onClick={handleStartPettySession} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold">▶ Start New Session</button>
-                                            </div>
-                                        )}
                                     </div>
-                                    {pettySessions.length > 0 && (
-                                        <div className="border-t pt-3 space-y-2">
-                                            <div className="font-bold text-xs">Previous Session Reports</div>
-                                            {pettySessions.map(session => (
-                                                <div key={session.id} className="flex flex-wrap justify-between gap-2 items-center bg-white/70 border rounded-lg p-3 text-xs">
-                                                    <div><b>{session.date}</b> · {session.id} <span className={`font-bold ${session.status === 'active' ? 'text-emerald-600' : 'text-slate-500'}`}>({session.status === 'active' ? 'REOPENED / ACTIVE' : 'CLOSED'})</span><div className="text-slate-500">Opening: Rs. {Number(session.openingAmount).toFixed(2)} · Expenses: Rs. {Number(session.totalExpenses).toFixed(2)} · Closing: Rs. {Number(session.closingBalance).toFixed(2)}</div><div className="text-slate-400">Started: {session.startedAt || 'Not recorded'} · Ended: {session.endedAt || 'Not recorded'}</div></div>
-                                                    <div className="flex gap-2">{!activePettySessionId && <button onClick={() => handleReopenPettySession(session)} className="px-3 py-1.5 rounded-lg bg-amber-600 text-white font-bold">↩ Reopen</button>}<button onClick={() => setSelectedPettyReport(session)} className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white font-bold">View Report</button><button onClick={() => { const report = session.vouchers || []; const esc = value => `\"${String(value ?? '').replaceAll('\"','\"\"')}\"`; const lines = report.map(v => [v.date,v.id,v.payee,v.category,v.reason,Number(v.amount).toFixed(2)].map(esc).join(',')).join('\n'); const csv = `Date,Voucher,Payee,Category,Reason,Amount\n${lines}\nSession Start Time,${esc(session.startedAt || 'Not recorded')}\nSession End Time,${esc(session.endedAt || 'Not recorded')}\nOpening Amount,,,,,${Number(session.openingAmount).toFixed(2)}\nTotal Expenses,,,,,${Number(session.totalExpenses).toFixed(2)}\nClosing Balance,,,,,${Number(session.closingBalance).toFixed(2)}`; const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'}); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `Petty_Cash_${session.date}_${session.id}.csv`; a.click(); URL.revokeObjectURL(url); }} className="px-3 py-1.5 rounded-lg bg-sky-600 text-white font-bold">Export CSV</button></div>
-                                                </div>
-                                            ))}
+                                    {activePettySessionId && (
+                                        <div className="p-3 rounded-xl border-2 border-amber-400 bg-amber-50 space-y-2">
+                                            <div className="text-xs font-black text-amber-900">✏️ Correct Total Cash — Active Session</div>
+                                            <div className="flex flex-wrap gap-2">
+                                                <input type="number" min="0" step="0.01" value={editPettyOpeningAmount} onChange={e => setEditPettyOpeningAmount(e.target.value)} placeholder="Enter correct total amount" className="border border-amber-300 rounded-lg px-3 py-2 text-sm w-full min-w-0 text-black bg-white" />
+                                                <button type="button" onClick={handleUpdateActivePettyOpening} className="px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-extrabold whitespace-nowrap">💾 Update Total</button>
+                                                <button type="button" onClick={() => setEditPettyOpeningAmount('')} className="px-3 py-2 rounded-lg bg-slate-600 hover:bg-slate-500 text-white text-xs font-extrabold whitespace-nowrap">✕ Clear Field</button>
+                                                <button type="button" onClick={handleClearActivePettyCash} className="px-3 py-2 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-extrabold whitespace-nowrap">🗑 Clear Total Cash</button>
+                                            </div>
+                                            <div className="text-[11px] text-amber-900">Session එක End නොකර මුළු මුදල නිවැරදි කරන්න. Clear Total Cash කළත් vouchers මැකෙන්නේ නැහැ. Add More Cash කළ මුදල් Total එකට එකතු වේ.</div>
+                                            <div className="flex flex-wrap gap-2">
+                                                <input type="number" min="0.01" step="0.01" value={newPettyTopUpAmount} onChange={e => setNewPettyTopUpAmount(e.target.value)} placeholder="Additional cash amount (Rs.)" className="border border-sky-300 rounded-lg px-3 py-2 text-sm w-full min-w-0 text-black bg-white" />
+                                                <button type="button" onClick={handleAddPettyTopUp} className="px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-extrabold whitespace-nowrap">＋ Add More Cash</button>
+                                            </div>
                                         </div>
                                     )}
-                                </div>
-
-                                {selectedPettyReport && (
-                                    <div className="fixed inset-0 z-[100] bg-black/60 flex items-center justify-center p-4 no-print" onClick={() => setSelectedPettyReport(null)}>
-                                        <div className="bg-white text-slate-900 rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] overflow-auto p-5" onClick={e => e.stopPropagation()}>
-                                            <div className="flex justify-between items-start gap-3 border-b pb-3 mb-4"><div><h3 className="text-lg font-extrabold">Petty Cash Session Report</h3><p className="text-xs text-slate-500">{selectedPettyReport.date} · {selectedPettyReport.id}</p><p className="text-xs text-slate-600 mt-1">Start Time: {selectedPettyReport.startedAt || 'Not recorded'} · End Time: {selectedPettyReport.endedAt || 'Not recorded'}</p></div><button onClick={() => setSelectedPettyReport(null)} className="px-3 py-1 rounded-lg bg-slate-200 font-bold">Close</button></div>
-                                            <div className="grid grid-cols-3 gap-2 mb-4 text-center"><div className="bg-sky-50 rounded-lg p-3"><div className="text-xs text-slate-500">Opening Amount</div><b>Rs. {Number(selectedPettyReport.openingAmount).toFixed(2)}</b></div><div className="bg-rose-50 rounded-lg p-3"><div className="text-xs text-slate-500">Total Expenses</div><b>Rs. {Number(selectedPettyReport.totalExpenses).toFixed(2)}</b></div><div className="bg-emerald-50 rounded-lg p-3"><div className="text-xs text-slate-500">Closing Balance</div><b>Rs. {Number(selectedPettyReport.closingBalance).toFixed(2)}</b></div></div>
-                                            <table className="w-full text-xs border-collapse"><thead><tr className="bg-slate-100"><th className="border p-2">Date</th><th className="border p-2">Voucher</th><th className="border p-2">Payee</th><th className="border p-2">Category</th><th className="border p-2">Reason</th><th className="border p-2 text-right">Amount (Rs.)</th></tr></thead><tbody>{(selectedPettyReport.vouchers || []).map(v => <tr key={v.id}><td className="border p-2">{v.date}</td><td className="border p-2">{v.id}</td><td className="border p-2">{v.payee}</td><td className="border p-2">{v.category}</td><td className="border p-2">{v.reason}</td><td className="border p-2 text-right">{Number(v.amount).toFixed(2)}</td></tr>)}{!(selectedPettyReport.vouchers || []).length && <tr><td colSpan="6" className="border p-4 text-center text-slate-500">No vouchers in this session.</td></tr>}</tbody></table>
-                                        </div>
-                                    </div>
-                                )}
-
-                                {editingPettyVoucher && currentUserProfile?.permissions?.admin && (
-                                    <div className="fixed inset-0 z-[110] bg-black/60 flex items-center justify-center p-4 no-print" onClick={() => setEditingPettyVoucher(null)}>
-                                        <div className="bg-white text-slate-900 rounded-2xl shadow-2xl w-full max-w-lg p-5 space-y-4" onClick={e => e.stopPropagation()}>
-                                            <div className="flex justify-between items-center border-b pb-3"><div><h3 className="text-lg font-extrabold">Edit Petty Cash Voucher</h3><p className="text-xs text-slate-500">{editingPettyVoucher.id}</p></div><button onClick={() => setEditingPettyVoucher(null)} className="px-3 py-1 rounded-lg bg-slate-200 font-bold">Close</button></div>
-                                            <label className="block text-xs font-bold">Payee<input value={editPettyPayee} onChange={e => setEditPettyPayee(e.target.value)} className="mt-1 w-full border rounded-lg p-2" /></label>
-                                            <label className="block text-xs font-bold">Category<select value={editPettyCategory} onChange={e => setEditPettyCategory(e.target.value)} className="mt-1 w-full border rounded-lg p-2">{pettyCategories.map(cat => <option key={cat} value={cat}>{cat}</option>)}</select></label>
-                                            <label className="block text-xs font-bold">Reason<input value={editPettyReason} onChange={e => setEditPettyReason(e.target.value)} className="mt-1 w-full border rounded-lg p-2" /></label>
-                                            <label className="block text-xs font-bold">Amount (Rs.)<input type="text" inputMode="decimal" onKeyDown={handleKeyDownNavigation} min="0.01" step="0.01" value={editPettyAmount} onChange={e => setEditPettyAmount(e.target.value)} onBlur={e => formatCurrencyBlur(e.target.value, setEditPettyAmount)} className="mt-1 w-full border rounded-lg p-2" /></label>
-                                            <label className="block text-xs font-bold">Time<input type="time" value={editPettyTime} onChange={e => setEditPettyTime(e.target.value)} className="mt-1 w-full border rounded-lg p-2" /></label>
-                                            <div className="flex justify-end gap-2"><button onClick={() => setEditingPettyVoucher(null)} className="px-4 py-2 rounded-lg bg-slate-200 font-bold text-xs">Cancel</button><button onClick={handleSavePettyVoucherEdit} className="px-4 py-2 rounded-lg bg-sky-600 text-white font-bold text-xs">Save Changes</button></div>
-                                        </div>
-                                    </div>
-                                )}
-
-                                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                                    <div className="space-y-4">
-                                        <form onSubmit={handleAddPettyVoucher} className={`space-y-4 text-xs ${theme.inputBg} p-5 rounded-2xl border ${theme.cardBorder}`}>
+                                    { /* New voucher form sits below the summary cards in the right column. */ }
+                                                                            <form onSubmit={handleAddPettyVoucher} className={`space-y-4 text-xs ${theme.inputBg} p-5 rounded-2xl border ${theme.cardBorder}`}>
                                             {!activePettySessionId && <div className="p-2 rounded-lg bg-rose-100 text-rose-700 font-bold text-center">Start a new session before adding vouchers.</div>}
                                             <h3 className="font-bold text-amber-500 text-sm border-b border-amber-500/20 pb-2">{t.newPettyHeader} ({pettyDateTo})</h3>
                                             <div>
@@ -3694,25 +3985,59 @@
                                                 {t.addVoucherBtn}
                                             </button>
                                         </form>
-
-                                        <div className={`space-y-3 text-xs ${theme.inputBg} p-4 rounded-2xl border ${theme.cardBorder}`}>
-                                            <h4 className="font-bold text-sky-500 text-xs">{t.addCategoryHeader}</h4>
-                                            <div className="flex gap-2">
-                                                <input type="text" placeholder="Category Name" value={newCategoryName} onKeyDown={handleKeyDownNavigation} onChange={e => setNewCategoryName(e.target.value)} className={`w-full ${theme.cardBg} border ${theme.inputBorder} rounded-xl px-3 py-1.5 text-black font-bold text-center`} />
-                                                <button onClick={handleAddCategory} className="px-3 py-1.5 bg-sky-600 text-white font-bold rounded-xl whitespace-nowrap shadow">+ Add</button>
-                                            </div>
-                                        </div>
                                     </div>
+                                    <div className="md:col-span-2 flex flex-col gap-3">
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    <div className={`self-start h-fit p-3 rounded-xl border ${theme.cardBorder} ${theme.inputBg} flex flex-col justify-center items-center`}>
+                                        <span className="text-xs font-extrabold text-rose-500 uppercase">📉 Vouchers Paid ({pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} - ${pettyDateTo}`})</span>
+                                        <span className="font-mono text-xl font-black text-rose-600 mt-1">Rs. {livePettyVouchersPaid.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
+                                    </div>
+                                    <div className={`self-start h-fit p-3 rounded-xl border-2 ${livePettyRemainingCash < 0 ? 'border-rose-500 bg-rose-500/10' : 'border-emerald-500 bg-emerald-500/10'} flex flex-col justify-center items-center`}>
+                                        <span className={`text-xs font-extrabold uppercase ${livePettyRemainingCash < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>🏦 Remaining Cash ({selectedPettySessionFilter !== 'all' ? selectedPettySessionFilter : (pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} - ${pettyDateTo}`)})</span>
+                                        <span className={`font-mono text-xl font-black mt-1 ${livePettyRemainingCash < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>Rs. {livePettyRemainingCash.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
+                                    </div>
+                                    </div>
+
+                                    <div className={`p-4 rounded-2xl border-2 border-amber-400 ${theme.inputBg} space-y-3 shadow-md`}>
+                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <div>
+                                            <div className="font-extrabold text-sm">Petty Cash Session</div>
+                                            <div className={`text-xs ${theme.subText}`}>{activePettySessionId ? `Active Session: ${activePettySessionId} · Total Cash Available: Rs. ${(Number(activePettySessionOpening || currentPettyOpenAmount || 0) + activePettyTopUps.reduce((sum, item) => sum + (Number(item.amount) || 0), 0)).toFixed(2)} · Started: ${activePettySessionStartedAt || localStorage.getItem('app_petty_active_session_started') || '—'}` : 'No active session — start a new session to enter vouchers.'}</div>
+
+                                        </div>
+                                        {activePettySessionId ? (
+                                            <button onClick={handleEndPettySession} className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold">⏹ End Session & Save Report</button>
+                                        ) : (
+                                            <div className="flex flex-wrap gap-2 items-center">
+                                                <input type="text" inputMode="decimal" onKeyDown={handleKeyDownNavigation} min="0" step="0.01" placeholder="New opening amount (Rs.)" value={newPettySessionAmount} onChange={e => setNewPettySessionAmount(e.target.value)} onBlur={e => formatCurrencyBlur(e.target.value, setNewPettySessionAmount)} className="border rounded-lg px-3 py-2 text-sm w-52" />
+                                                <button type="button" onClick={() => setNewPettySessionAmount('')} disabled={!newPettySessionAmount} className="px-3 py-2 rounded-xl bg-slate-500 hover:bg-slate-600 disabled:opacity-40 text-white text-xs font-extrabold">✕ Clear</button>
+                                                <button onClick={handleStartPettySession} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold">▶ Start Session</button>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="border-t pt-3 space-y-2">
+                                            <div className="font-bold text-xs">Previous Session Reports · Each Ended Session Separately</div><div className="text-[11px] text-slate-500">Select View / Print, or delete only the session you choose. Reports are not combined.</div>
+                                            {filteredPettySessions.map(session => (
+                                                <div key={session.id} className="flex flex-wrap justify-between gap-2 items-center bg-white/70 border-2 border-slate-200 rounded-xl p-3 text-xs shadow-sm">
+                                                    <div><b>{session.date}</b> · {session.id} <span className={`font-bold ${session.status === 'active' ? 'text-emerald-600' : 'text-slate-500'}`}>({'CLOSED'})</span><div className="text-slate-500">Opening: Rs. {Number(session.openingAmount).toFixed(2)} · Expenses: Rs. {Number(session.totalExpenses).toFixed(2)} · Closing: Rs. {Number(session.closingBalance).toFixed(2)}</div><div className="text-slate-400">Started: {session.startedAt || 'Not recorded'} · Ended: {session.endedAt || 'Not recorded'}</div></div>
+                                                    <div className="flex gap-2">{!activePettySessionId && session.status !== 'active' && !!session.endedAt && <button onClick={() => handleReopenPettySession(session)} className="px-3 py-1.5 rounded-lg bg-amber-600 text-white font-bold">↩ Reopen</button>}<button onClick={() => loadPettySessionVouchers(session)} className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white font-bold">Load Vouchers</button><button onClick={() => openPettySessionReport(session)} className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white font-bold">View Report</button><button onClick={() => handlePrintPettySessionReport(session)} className="px-3 py-1.5 rounded-lg bg-slate-700 text-white font-bold">Print Report</button>{<button type="button" title="Delete only this session report and its linked vouchers" onClick={() => handleDeletePettySession(session)} className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-extrabold border border-rose-900">🗑 Delete Report</button>}<button onClick={() => { const report = session.vouchers || []; const esc = value => `\"${String(value ?? '').replaceAll('\"','\"\"')}\"`; const lines = report.map(v => [v.date,v.id,v.payee,v.category,v.reason,Number(v.amount).toFixed(2)].map(esc).join(',')).join('\n'); const csv = `Date,Voucher,Payee,Category,Reason,Amount\n${lines}\nSession Start Time,${esc(session.startedAt || 'Not recorded')}\nSession End Time,${esc(session.endedAt || 'Not recorded')}\nOpening Amount,,,,,${Number(session.openingAmount).toFixed(2)}\nAdditional Cash,,,,,${Number(session.totalAdditionalFunds ?? (session.topUps || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0)).toFixed(2)}\nTotal Expenses,,,,,${Number(session.totalExpenses).toFixed(2)}\nClosing Balance,,,,,${Number(session.closingBalance).toFixed(2)}`; const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'}); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `Petty_Cash_${session.date}_${session.id}.csv`; a.click(); URL.revokeObjectURL(url); }} className="px-3 py-1.5 rounded-lg bg-sky-600 text-white font-bold">Export CSV</button></div>
+                                                </div>
+                                            ))}
+                                            {filteredPettySessions.length === 0 && <div className="text-xs text-slate-500 text-center py-3">No saved Petty Cash session reports yet. End a session to save its report.</div>}
+                                        </div>
+                                </div>
 
                                     <div className="lg:col-span-2 space-y-4">
                                         <div className="flex justify-between items-center">
-                                            <h3 className={`font-bold text-sm ${theme.text}`}>{t.issuedVouchersHeader} ({pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} to ${pettyDateTo}`})</h3>
+                                            <h3 className={`font-bold text-sm ${theme.text}`}>{t.issuedVouchersHeader} ({pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} to ${pettyDateTo}`}) · {selectedPettySessionFilter === 'all' ? 'All Sessions' : selectedPettySessionFilter}</h3>{selectedPettySessionFilter !== 'all' && <button onClick={() => setSelectedPettySessionFilter('all')} className="text-xs px-3 py-1 rounded-lg bg-slate-600 text-white font-bold">Show All Sessions</button>}
                                             <span className="font-mono text-amber-500 text-xs font-bold">Total: Rs. {totalPettyCashAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
                                         </div>
                                         <div className={`overflow-x-auto border ${theme.cardBorder} rounded-2xl`}>
                                             <table className="w-full text-xs text-left">
                                                 <thead className={`${theme.tableHeaderBg} ${theme.subText} font-bold border-b ${theme.cardBorder}`}>
                                                     <tr>
+                                                        <th className="p-3">Date</th>
+                                                        <th className="p-3">Session ID</th>
                                                         <th className="p-3">{t.voucherId}</th>
                                                         <th className="p-3">{t.payee}</th>
                                                         <th className="p-3">{t.categoryLabel}</th>
@@ -3723,10 +4048,12 @@
                                                 </thead>
                                                 <tbody className={`divide-y ${theme.cardBorder} ${theme.text}`}>
                                                     {filteredPettyVouchers.length === 0 ? (
-                                                        <tr><td colSpan={6} className={`p-6 text-center ${theme.subText}`}>No vouchers recorded for {pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} to ${pettyDateTo}`}.</td></tr>
+                                                        <tr><td colSpan={8} className={`p-6 text-center ${theme.subText}`}>No vouchers recorded for {pettyDateFrom === pettyDateTo ? pettyDateFrom : `${pettyDateFrom} to ${pettyDateTo}`}.</td></tr>
                                                     ) : (
                                                         filteredPettyVouchers.map(v => (
-                                                            <tr key={v.id} className="hover:bg-amber-500/5 transition">
+                                                            <tr key={`${v.sessionId || 'legacy'}-${v.id}`} className="hover:bg-amber-500/5 transition">
+                                                                <td className="p-3 font-mono whitespace-nowrap">{normalizePettyVoucherDate(v.isoDate) || normalizePettyVoucherDate(v.date) || v.date || '—'}</td>
+                                                                <td className="p-3 font-mono text-[10px] text-sky-600 whitespace-nowrap">{v.sessionId || 'Legacy / No Session ID'}</td>
                                                                 <td className="p-3 font-mono font-bold text-amber-500">{v.id}</td>
                                                                 <td className="p-3 font-bold">{v.payee}</td>
                                                                 <td className="p-3"><span className={`px-2 py-0.5 rounded-full text-[10px] ${theme.inputBg} border ${theme.cardBorder}`}>{v.category}</span></td>
@@ -3746,6 +4073,49 @@
                                             </table>
                                         </div>
                                     </div>
+
+                                    </div>
+                                </div>
+
+                                {selectedPettyReport && (
+                                    <div className="fixed inset-0 z-[100] bg-black/60 flex items-center justify-center p-4 no-print" onClick={() => setSelectedPettyReport(null)}>
+                                        <div className="bg-white text-slate-900 rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] overflow-auto p-5" onClick={e => e.stopPropagation()}>
+                                            <div className="flex justify-between items-start gap-3 border-b pb-3 mb-4"><div><h3 className="text-lg font-extrabold">Petty Cash Session Report</h3><p className="text-xs text-slate-500">{selectedPettyReport.date} · {selectedPettyReport.id}</p><p className="text-xs text-slate-600 mt-1">Start Time: {selectedPettyReport.startedAt || 'Not recorded'} · End Time: {selectedPettyReport.endedAt || 'Not recorded'}</p></div><div className="flex gap-2"><button onClick={() => handlePrintPettySessionReport(selectedPettyReport)} className="px-3 py-1 rounded-lg bg-sky-600 text-white font-bold">Print</button><button onClick={() => setSelectedPettyReport(null)} className="px-3 py-1 rounded-lg bg-slate-200 font-bold">Close</button></div></div>
+                                            <div className="grid grid-cols-4 gap-2 mb-4 text-center"><div className="bg-sky-50 rounded-lg p-3"><div className="text-xs text-slate-500">Total Cash Available</div><b>Rs. {(Number(selectedPettyReport.openingAmount || 0) + (selectedPettyReport.topUps || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0)).toFixed(2)}</b></div><div className="bg-cyan-50 rounded-lg p-3"><div className="text-xs text-slate-500">Additional Cash</div><b>Rs. {(selectedPettyReport.topUps || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0).toFixed(2)}</b></div><div className="bg-rose-50 rounded-lg p-3"><div className="text-xs text-slate-500">Total Expenses</div><b>Rs. {(selectedPettyReport.vouchers || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0).toFixed(2)}</b></div><div className="bg-emerald-50 rounded-lg p-3"><div className="text-xs text-slate-500">Closing Balance</div><b>Rs. {((Number(selectedPettyReport.openingAmount) || 0) + (selectedPettyReport.topUps || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0) - (selectedPettyReport.vouchers || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0)).toFixed(2)}</b></div></div>
+                                            <div className="font-bold text-sm mb-2">Additional Cash Received</div><table className="w-full text-xs border-collapse mb-4"><thead><tr className="bg-cyan-50"><th className="border p-2">Date</th><th className="border p-2">Time</th><th className="border p-2">Added By</th><th className="border p-2 text-right">Amount (Rs.)</th></tr></thead><tbody>{(selectedPettyReport.topUps || []).map(item => <tr key={item.id}><td className="border p-2">{item.date}</td><td className="border p-2">{item.time}</td><td className="border p-2">{item.addedBy}</td><td className="border p-2 text-right">{Number(item.amount).toFixed(2)}</td></tr>)}{!(selectedPettyReport.topUps || []).length && <tr><td colSpan="4" className="border p-3 text-center text-slate-500">No additional cash added.</td></tr>}<tr className="bg-cyan-50 font-extrabold"><td colSpan="3" className="border p-2 text-right">TOTAL ADDITIONAL CASH</td><td className="border p-2 text-right">{(selectedPettyReport.topUps || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0).toFixed(2)}</td></tr></tbody></table>
+                                            <div className="font-bold text-sm mb-2">Expense Vouchers</div><table className="w-full text-xs border-collapse"><thead><tr className="bg-slate-100"><th className="border p-2">Date</th><th className="border p-2">Voucher</th><th className="border p-2">Payee</th><th className="border p-2">Category</th><th className="border p-2">Reason</th><th className="border p-2 text-right">Amount (Rs.)</th></tr></thead><tbody>{(selectedPettyReport.vouchers || []).map(v => <tr key={v.id}><td className="border p-2">{v.date}</td><td className="border p-2">{v.id}</td><td className="border p-2">{v.payee}</td><td className="border p-2">{v.category}</td><td className="border p-2">{v.reason}</td><td className="border p-2 text-right">{Number(v.amount).toFixed(2)}</td></tr>)}{!(selectedPettyReport.vouchers || []).length && <tr><td colSpan="6" className="border p-4 text-center text-slate-500">No vouchers in this session.</td></tr>}<tr className="bg-slate-100 font-extrabold"><td colSpan="5" className="border p-2 text-right">TOTAL EXPENSES</td><td className="border p-2 text-right">{(selectedPettyReport.vouchers || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0).toFixed(2)}</td></tr></tbody></table>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {editingPettyVoucher && currentUserProfile?.permissions?.admin && (
+                                    <div className="fixed inset-0 z-[110] bg-black/60 flex items-center justify-center p-4 no-print" onClick={() => setEditingPettyVoucher(null)}>
+                                        <div className="bg-white text-slate-900 rounded-2xl shadow-2xl w-full max-w-lg p-5 space-y-4" onClick={e => e.stopPropagation()}>
+                                            <div className="flex justify-between items-center border-b pb-3"><div><h3 className="text-lg font-extrabold">Edit Petty Cash Voucher</h3><p className="text-xs text-slate-500">{editingPettyVoucher.id}</p></div><button onClick={() => setEditingPettyVoucher(null)} className="px-3 py-1 rounded-lg bg-slate-200 font-bold">Close</button></div>
+                                            <label className="block text-xs font-bold">Payee<input value={editPettyPayee} onChange={e => setEditPettyPayee(e.target.value)} className="mt-1 w-full border rounded-lg p-2" /></label>
+                                            <label className="block text-xs font-bold">Category<select value={editPettyCategory} onChange={e => setEditPettyCategory(e.target.value)} className="mt-1 w-full border rounded-lg p-2">{pettyCategories.map(cat => <option key={cat} value={cat}>{cat}</option>)}</select></label>
+                                            <label className="block text-xs font-bold">Reason<input value={editPettyReason} onChange={e => setEditPettyReason(e.target.value)} className="mt-1 w-full border rounded-lg p-2" /></label>
+                                            <label className="block text-xs font-bold">Amount (Rs.)<input type="text" inputMode="decimal" onKeyDown={handleKeyDownNavigation} min="0.01" step="0.01" value={editPettyAmount} onChange={e => setEditPettyAmount(e.target.value)} onBlur={e => formatCurrencyBlur(e.target.value, setEditPettyAmount)} className="mt-1 w-full border rounded-lg p-2" /></label>
+                                            <label className="block text-xs font-bold">Time<input type="time" value={editPettyTime} onChange={e => setEditPettyTime(e.target.value)} className="mt-1 w-full border rounded-lg p-2" /></label>
+                                            <div className="flex justify-end gap-2"><button onClick={() => setEditingPettyVoucher(null)} className="px-4 py-2 rounded-lg bg-slate-200 font-bold text-xs">Cancel</button><button onClick={handleSavePettyVoucherEdit} className="px-4 py-2 rounded-lg bg-sky-600 text-white font-bold text-xs">Save Changes</button></div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                                    <div className="space-y-4">
+
+
+                                        <div className={`space-y-3 text-xs ${theme.inputBg} p-4 rounded-2xl border ${theme.cardBorder}`}>
+                                            <h4 className="font-bold text-sky-500 text-xs">{t.addCategoryHeader}</h4>
+                                            <div className="flex gap-2">
+                                                <input type="text" placeholder="Category Name" value={newCategoryName} onKeyDown={handleKeyDownNavigation} onChange={e => setNewCategoryName(e.target.value)} className={`w-full ${theme.cardBg} border ${theme.inputBorder} rounded-xl px-3 py-1.5 text-black font-bold text-center`} />
+                                                <button onClick={handleAddCategory} className="px-3 py-1.5 bg-sky-600 text-white font-bold rounded-xl whitespace-nowrap shadow">+ Add</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    
                                 </div>
                             </div>
                         )}
